@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "io.gitHub.rhythmcache.vector.link"
+    namespace = "io.github.rhythmcache.vector.link"
     compileSdk = 34
 
     defaultConfig {
