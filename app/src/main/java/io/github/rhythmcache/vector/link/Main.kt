@@ -541,21 +541,21 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                 }
                 if (stop > 0) {
                     SliderRow(
-                        "Stop charging at", stop, 50..100, { "$it%" },
+                        "Stop charging at", stop, 50..99, { "$it%" },
                         help = HelpInfo(
                             "Stop charging at",
-                            "Battery percentage where charging stops. The kernel then holds the charge and waits for the battery to drop to the resume level. The kernel only accepts 50% to 100%.",
+                            "Battery percentage where charging stops. The kernel then holds the charge and waits for the battery to drop to the resume level. The kernel only accepts 50% to 99%; writing 100 turns the limiter off.",
                             "80% keeps the battery near 75–80% overnight instead of sitting at 100%.",
                         ),
                     ) { s ->
-                        val r = if (resume in 1 until s) resume else (s - 5).coerceAtLeast(1)
+                        val r = if (resume in 20..(s - 2)) resume else (s - 5).coerceIn(20, s - 2)
                         vm.setLimit(s, r)
                     }
                     SliderRow(
-                        "Resume charging at", resume.coerceIn(1, stop - 1), 1..(stop - 1), { "$it%" },
+                        "Resume charging at", resume.coerceIn(20, stop - 2), 20..(stop - 2), { "$it%" },
                         help = HelpInfo(
                             "Resume charging at",
-                            "Battery percentage where charging starts again after the limiter stopped it. It must be lower than the stop level. The gap between the two stops the phone from toggling charging on and off every few seconds.",
+                            "Battery percentage where charging starts again after the limiter stopped it. The kernel only accepts 20% up to 2% below the stop level, so it has to be at least two points lower. The gap between the two stops the phone from toggling charging on and off every few seconds.",
                             "Stop 80% / resume 75%: after reaching 80%, the phone waits until 75% before charging again.",
                         ),
                     ) { r ->
@@ -564,8 +564,8 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                 }
                 if (has(VectorNodes.LIMIT_STATE)) {
                     val label = when (n[VectorNodes.LIMIT_STATE]) {
-                        0 -> "Idle (off or unplugged)"
-                        1 -> "Charging"
+                        0 -> "Limiter off"
+                        1 -> "Charging (or cable unplugged)"
                         2 -> "Holding at limit, waiting to resume"
                         else -> "Unknown"
                     }
@@ -573,7 +573,7 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                         "Limiter status: $label",
                         HelpInfo(
                             "Limiter status",
-                            "Read-only status from the kernel.\n\n• Idle: the limiter is off or the cable is unplugged.\n• Charging: the battery is below the stop level.\n• Holding: the stop level was reached and charging is paused until the battery falls to the resume level.",
+                            "Read-only status from the kernel.\n\n• Off: the limiter is disabled (stop is 0).\n• Charging: the limiter is enabled and the battery is below the stop level. The kernel also reports this while the cable is unplugged.\n• Holding: the stop level was reached and charging is paused until the battery falls to the resume level.",
                             "Holding while plugged in at 80% is normal: the phone runs from USB power and waits to resume at 75%.",
                         ),
                         style = MaterialTheme.typography.bodySmall,
@@ -596,14 +596,14 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                     ),
                 ) { vm.set(VectorNodes.BYPASS, it) }
                 if (has(VectorNodes.ICL)) SliderRow(
-                    "USB input current limit", n[VectorNodes.ICL] ?: 0, 0..3000,
+                    "USB input current limit", n[VectorNodes.ICL] ?: 0, 0..1500,
                     { if (it == 0) "Stock" else "$it mA" },
-                    desc = "Raise this if a charger is stuck at 500 mA. Stock = no override.",
+                    desc = "Raise this if a USB charger is stuck at 500 mA. Stock = no override.",
                     step = 100,
                     help = HelpInfo(
                         "USB input current limit",
-                        "Overrides the stock input-current cap. Use this when a proper charger or cable is wrongly detected as a low-power USB port and only draws 500 mA. \"Stock\" (0) keeps the normal behavior. Higher values let the phone pull more current, but the charger, cable and port must actually support it.",
-                        "A 5V/2A charger stuck at 500 mA can be raised to about 1500 mA. 3000 mA on a weak charger can cause overheating, voltage drops or unstable charging.",
+                        "Overrides the input-current cap for chargers detected as plain USB (SDP), which otherwise draw only 500 mA. The kernel accepts 0 (stock) or 100–1500 mA: nonzero values below 100 are raised to 100, and values above 1500 are clamped. It is cleared automatically when the cable is unplugged. DCP/HVDCP/PD chargers are not affected.",
+                        "A 5V/2A charger wrongly detected as USB can be raised to about 1500 mA. 1500 mA on a weak charger can cause overheating, voltage drops or unstable charging.",
                     ),
                 ) { vm.set(VectorNodes.ICL, it) }
             }
@@ -618,17 +618,17 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                     on(VectorNodes.IGN_CHG),
                     help = HelpInfo(
                         "Ignore vendor charging thermal",
-                        "Stops Xiaomi's mi_thermald daemon from cutting the charging current when the phone frame (skin) gets warm. The kernel's JEITA temperature limits and the battery trip temperature still apply, so hardware safety stays active. Enable it only if charging keeps dropping to a few watts while the actual battery is still cool.",
+                        "Stops Xiaomi's mi_thermald daemon from cutting the charging current when the phone frame (skin) gets warm. The kernel's JEITA temperature limits and the battery trip temperature still apply, so hardware safety stays active. Enable it only if charging keeps dropping to a few watts while the actual battery is still cool.\n\nThis is also the master switch for the CPU, GPU and display overrides below: they only take effect while this toggle is on and the battery is below its guard temperatures.",
                         "If fast charging falls to ~5W at 36 °C battery because the frame is warm, enabling this keeps full speed until the trip temperature is reached.",
                     ),
                 ) { vm.set(VectorNodes.IGN_CHG, it) }
                 if (has(VectorNodes.VENDOR_MAX)) SliderRow(
                     "Throttle ceiling", n[VectorNodes.VENDOR_MAX] ?: 18, 0..24,
                     { if (it == 0) "0 (none)" else "$it" },
-                    desc = "Highest vendor throttle step still obeyed. Lower = faster charging. Only active when the toggle above is on.",
+                    desc = "Highest vendor throttle step still obeyed. Lower = faster charging. Only active while the toggle above is on and the battery is below its guard temperatures.",
                     help = HelpInfo(
                         "Throttle ceiling",
-                        "Xiaomi's daemon requests throttle steps from 0 (none) to 24 (strongest). While the toggle above is on, the kernel applies min(requested step, this ceiling), so the ceiling caps how hard the vendor can throttle charging. 0 ignores vendor throttling completely; the default 18 allows up to about 3.5 A. It has no effect while the toggle is off.",
+                        "Xiaomi's daemon requests throttle steps from 0 (none) to 24 (strongest). While the toggle above is on and the battery is under its guard temperatures, the kernel applies min(requested step, this ceiling), so the ceiling caps how hard the vendor can throttle charging. 0 ignores vendor throttling completely; the default 18 allows up to about 3.5 A. It has no effect while the toggle is off or while the battery guard is enforcing stock throttling.",
                         "Set 0 for maximum charging speed. Set 12 to let the vendor throttle charging, but never beyond step 12.",
                     ),
                 ) { vm.set(VectorNodes.VENDOR_MAX, it) }
@@ -641,14 +641,17 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
             VectorNodes.IGN_GPU, VectorNodes.GPU_MAX, VectorNodes.IGN_BL,
         )
         if (perfNodes.any { has(it) }) item {
-            Section("CPU, GPU & display") {
+            Section(
+                "CPU, GPU & display",
+                subtitle = "These overrides only take effect while “Ignore vendor charging thermal” is on and the battery is below its guard temperatures.",
+            ) {
                 if (has(VectorNodes.IGN_CPU)) ToggleRow(
                     "Ignore vendor CPU thermal",
                     "Don't let Xiaomi's thermal daemon lower CPU clocks because the frame feels warm",
                     on(VectorNodes.IGN_CPU),
                     help = HelpInfo(
                         "Ignore vendor CPU thermal",
-                        "Prevents mi_thermald from capping CPU clock speeds just because the phone's exterior is warm. The kernel's own protection stays active: all overrides are revoked when the battery reaches the trip temperature.",
+                        "Prevents mi_thermald from capping CPU clock speeds just because the phone's exterior is warm. The kernel's own protection stays active: this override stops while the battery is at its trip temperature or JEITA hot limit, and the optional frame limit can also revoke it.",
                         "Enable for sustained gaming or heavy apps when the phone feels warm but the battery is still below about 40 °C.",
                     ),
                 ) { vm.set(VectorNodes.IGN_CPU, it) }
@@ -679,7 +682,7 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                     on(VectorNodes.IGN_GPU),
                     help = HelpInfo(
                         "Ignore vendor GPU thermal",
-                        "Prevents mi_thermald from downclocking the Adreno GPU because the phone frame is warm. The kernel still revokes this override at the battery trip temperature.",
+                        "Prevents mi_thermald from downclocking the Adreno GPU because the phone frame is warm. The kernel still revokes this override at the battery trip temperature, and the optional frame limit can also revoke it.",
                         "Useful for games that start stuttering after a few minutes even though the battery temperature is still moderate.",
                     ),
                 ) { vm.set(VectorNodes.IGN_GPU, it) }
@@ -711,7 +714,7 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
         if (has(VectorNodes.TRIP) || has(VectorNodes.SKIN)) item {
             Section(
                 "Safety guardrails",
-                subtitle = "When a limit is reached, every override above switches off automatically.",
+                subtitle = "When the battery trip temperature is reached, the charging, CPU, GPU and display overrides switch off automatically.",
             ) {
                 val trip = n[VectorNodes.TRIP] ?: 450
                 if (has(VectorNodes.TRIP)) SliderRow(
@@ -720,7 +723,7 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                     step = 5,
                     help = HelpInfo(
                         "Battery trip temperature",
-                        "Hard safety tripwire based on the real battery cell temperature from the fuel gauge. When it's reached, every thermal override is cancelled immediately and stock throttling is restored. Default is 45.0 °C; allowed range is 40.0–47.0 °C. Lower is safer.",
+                        "Hard safety tripwire based on the real battery cell temperature from the fuel gauge. When it's reached, the charging, CPU, GPU and display overrides are cancelled immediately and stock throttling is restored. Default is 45.0 °C; allowed range is 40.0–47.0 °C. Lower is safer.",
                         "43.0 °C gives an extra safety margin while gaming; 45.0 °C is the default.",
                     ),
                 ) { vm.set(VectorNodes.TRIP, it) }
@@ -743,11 +746,11 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                     val skin = n[VectorNodes.SKIN] ?: 0
                     ToggleRow(
                         "Frame temperature limit",
-                        "Also switch overrides off when the phone's frame gets too hot",
+                        "Also switch CPU, GPU and display overrides off when the phone's frame gets too hot",
                         skin > 0,
                         help = HelpInfo(
                             "Frame temperature limit",
-                            "Optional extra guardrail that watches the chassis (skin) thermistor. If the frame reaches the chosen temperature, all thermal overrides are revoked, and they return after it cools by 2 °C. Off by default. This protects your hands and the exterior, not the battery chemistry.",
+                            "Optional extra guardrail that watches the chassis (skin) thermistor. If the frame reaches the chosen temperature, the CPU, GPU and display overrides are revoked, and they return after the frame cools 2 °C below it. The charging-throttle override is not affected by this frame limit; it is controlled by the battery trip temperature. Off by default. This protects your hands and the exterior, not the battery chemistry.",
                             "Set 50 °C so overrides switch off if the frame becomes uncomfortably hot to hold.",
                         ),
                     ) {
@@ -759,7 +762,7 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                         step = 500,
                         help = HelpInfo(
                             "Frame limit",
-                            "Chassis temperature where the guardrail revokes overrides. Range 45.0–60.0 °C, in 0.5 °C steps.",
+                            "Chassis temperature where the guardrail revokes the CPU, GPU and display overrides. Range 45.0–60.0 °C; the app adjusts it in 0.5 °C steps.",
                             "50.0 °C is a reasonable starting point; 45.0 °C is very conservative.",
                         ),
                     ) { vm.set(VectorNodes.SKIN, it) }
