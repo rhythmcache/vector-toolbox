@@ -15,20 +15,19 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -41,11 +40,13 @@ import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -123,10 +124,6 @@ object VectorRepo {
 
     suspend fun hasRoot(): Boolean = withContext(Dispatchers.IO) { Shell.getShell().isRoot }
 
-    suspend fun hasNodes(): Boolean = withContext(Dispatchers.IO) {
-        Shell.cmd("test -d ${VectorNodes.DIR}").exec().isSuccess
-    }
-
     fun resetShell() {
         Shell.getCachedShell()?.close()
     }
@@ -141,7 +138,9 @@ object VectorRepo {
             val key = line.substring(2, eq)
             val value = line.substring(eq + 1).trim()
             when {
-                line.startsWith("n:") -> value.toIntOrNull()?.let { nodes[key] = it }
+                // take the first token in case a node ever prints "80 75"
+                line.startsWith("n:") ->
+                    value.split(" ").firstOrNull()?.toIntOrNull()?.let { nodes[key] = it }
                 line.startsWith("b:") -> batt[key] = value
             }
         }
@@ -202,6 +201,8 @@ class VectorViewModel : ViewModel() {
         }
     }
 
+    fun dismissError() = _state.update { it.copy(error = null) }
+
     private suspend fun refreshLocked() {
         val gate = _state.value.gate
         if (gate == Gate.NoRoot) return
@@ -209,11 +210,12 @@ class VectorViewModel : ViewModel() {
             _state.update { it.copy(gate = Gate.NoRoot) }
             return
         }
-        if (!VectorRepo.hasNodes()) {
-            _state.update { it.copy(gate = Gate.NoNodes) }
+        val snap = VectorRepo.read()
+        if (snap.nodes.isEmpty()) {
+            // Nothing readable under /sys/kernel/vector. Keeps retrying on every poll.
+            _state.update { it.copy(gate = Gate.NoNodes, snap = null) }
             return
         }
-        val snap = VectorRepo.read()
 
         // Overlay pending writes so a stale kernel value can't flip the UI back.
         val now = SystemClock.elapsedRealtime()
@@ -231,28 +233,42 @@ class VectorViewModel : ViewModel() {
         _state.update { it.copy(gate = Gate.Ready, snap = snap.copy(nodes = merged)) }
     }
 
-    /** value may be "80 75" for the dual-value charge_stop_pct syntax. */
-    fun set(node: String, value: String) {
+    private fun write(node: String, value: String, expected: Map<String, Int>) {
         viewModelScope.launch {
             mutex.withLock {
-                val first = value.trim().split(" ").firstOrNull()?.toIntOrNull()
-                if (first != null) {
-                    pending[node] = Pending(first, SystemClock.elapsedRealtime() + 3000)
-                    // instant UI feedback
-                    _state.update { s ->
-                        s.snap?.let { s.copy(snap = it.copy(nodes = it.nodes + (node to first))) } ?: s
-                    }
+                val until = SystemClock.elapsedRealtime() + 3000
+                expected.forEach { (k, v) -> pending[k] = Pending(v, until) }
+                // instant UI feedback
+                _state.update { s ->
+                    s.snap?.let { s.copy(snap = it.copy(nodes = it.nodes + expected)) } ?: s
                 }
                 val ok = VectorRepo.write(node, value)
-                if (!ok) pending.remove(node)
-                _state.update { it.copy(error = if (ok) null else "Write failed: $node = $value") }
+                if (!ok) expected.keys.forEach { pending.remove(it) }
+                _state.update {
+                    it.copy(
+                        error = if (ok) null
+                        else "Couldn't write \"$value\" to $node. The kernel may have rejected the value."
+                    )
+                }
                 refreshLocked()
             }
         }
     }
 
+    /** value may be "80 75" for the dual-value syntax; only the first number is tracked. */
+    fun set(node: String, value: String) {
+        val first = value.trim().split(" ").firstOrNull()?.toIntOrNull()
+        write(node, value, if (first != null) mapOf(node to first) else emptyMap())
+    }
+
     fun set(node: String, value: Int) = set(node, value.toString())
     fun set(node: String, on: Boolean) = set(node, if (on) 1 else 0)
+
+    /** Writes stop + resume together and tracks both so neither slider snaps back. */
+    fun setLimit(stop: Int, resume: Int) = write(
+        VectorNodes.STOP, "$stop $resume",
+        mapOf(VectorNodes.STOP to stop, VectorNodes.RESUME to resume),
+    )
 }
 
 // ============================================================
@@ -272,11 +288,20 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// Largest system font scale the app will follow. Delete the CompositionLocalProvider
+// below if you want full system font scaling.
+private const val MAX_FONT_SCALE = 1.3f
+
 @Composable
 fun VectorTheme(content: @Composable () -> Unit) {
     val ctx = LocalContext.current
     val scheme = if (Build.VERSION.SDK_INT >= 31) dynamicDarkColorScheme(ctx) else darkColorScheme()
-    MaterialTheme(colorScheme = scheme, content = content)
+    val d = LocalDensity.current
+    CompositionLocalProvider(
+        LocalDensity provides Density(d.density, d.fontScale.coerceAtMost(MAX_FONT_SCALE))
+    ) {
+        MaterialTheme(colorScheme = scheme, content = content)
+    }
 }
 
 // ============================================================
@@ -289,13 +314,15 @@ private const val PREF_DISCLAIMER = "disclaimer_accepted"
 private val DISCLAIMER_TEXT = """
     This app writes directly to your kernel's charging and thermal controls. Wrong values can overheat the phone, damage the battery, cause random shutdowns, or shorten battery life.
 
-    Thermal overrides are especially risky. Xiaomi's mi_thermald normally keeps the outside of the phone comfortable; bypassing it lets the device run hotter. The kernel's JEITA limits and the 45 °C tripwire are safety nets, not a licence to ignore heat.
+    Thermal overrides are especially risky. Xiaomi's mi_thermald normally keeps the outside of the phone comfortable; bypassing it lets the device run hotter. The kernel's JEITA limits and the battery trip temperature are safety nets, not a license to ignore heat.
 
-    You are fully responsible for every value you change. Do not leave the phone unattended while charging with overrides enabled, do not raise trip temperatures casually, and stop using an override if the device gets unusually hot.
+    You are fully responsible for every value you change. Don't leave the phone unattended while charging with overrides enabled, don't raise the trip temperature casually, and turn an override off if the device gets unusually hot.
+
+    Settings are not saved by the kernel: everything returns to its default after a reboot.
 
     The developer is not liable for any damage, data loss, fire, injury, or warranty issues caused by using this app. Use at your own risk.
 
-    Tap the ? next to any setting to see what it does and an example.
+    Tap the ⓘ icon next to any setting to see what it does and an example.
 """.trimIndent()
 
 data class HelpInfo(
@@ -307,22 +334,32 @@ data class HelpInfo(
 @Composable
 fun HelpButton(info: HelpInfo, modifier: Modifier = Modifier) {
     var open by remember { mutableStateOf(false) }
-    Box(
-        modifier
-            .size(22.dp)
-            .clip(CircleShape)
-            .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
-            .clickable { open = true },
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            "?",
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.primary,
+    IconButton(onClick = { open = true }, modifier = modifier.size(36.dp)) {
+        Icon(
+            Icons.Filled.Info,
+            contentDescription = "Help: ${info.title}",
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp),
         )
     }
     if (open) HelpDialog(info) { open = false }
+}
+
+/** Title that wraps if needed, with the help button always visible right after it. */
+@Composable
+fun LabelWithHelp(
+    text: String,
+    help: HelpInfo?,
+    modifier: Modifier = Modifier,
+    style: TextStyle = MaterialTheme.typography.bodyLarge,
+) {
+    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+        Text(text, style = style, modifier = Modifier.weight(1f, fill = false))
+        if (help != null) {
+            Spacer(Modifier.width(4.dp))
+            HelpButton(help)
+        }
+    }
 }
 
 @Composable
@@ -409,12 +446,12 @@ fun App(vm: VectorViewModel) {
                 Gate.Loading -> CircularProgressIndicator(Modifier.align(Alignment.Center))
                 Gate.NoRoot -> Message(
                     "Root access required",
-                    "Grant root to this app in your root manager (KernelSU / Magisk), then retry.",
+                    "Grant root to this app in your root manager (KernelSU / Magisk), then tap Retry.",
                     vm::retry,
                 )
                 Gate.NoNodes -> Message(
                     "Vector kernel not detected",
-                    "${VectorNodes.DIR} does not exist. This app needs a Vector kernel that exposes these nodes.",
+                    "Nothing could be read from ${VectorNodes.DIR}. This app only works on a Vector kernel that exposes these controls.",
                     vm::retry,
                 )
                 Gate.Ready -> s.snap?.let { Dashboard(it, s.error, vm) }
@@ -459,14 +496,30 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                 )
-                Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.width(4.dp))
                 HelpButton(HelpInfo("Safety notes", DISCLAIMER_TEXT))
             }
         }
         item { Header(snap) }
 
         if (error != null) item {
-            Text(error, color = MaterialTheme.colorScheme.error)
+            Surface(
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = MaterialTheme.shapes.medium,
+            ) {
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        error,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = vm::dismissError) { Text("Dismiss") }
+                }
+            }
         }
 
         // ---------- Charge limiter ----------
@@ -475,55 +528,56 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                 val stop = n[VectorNodes.STOP] ?: 0
                 val resume = n[VectorNodes.RESUME] ?: 0
                 ToggleRow(
-                    "Enable charge limit",
-                    "Stop charging at a set level (0 = disabled)",
+                    "Charge limit",
+                    "Pause charging at a chosen battery level",
                     stop > 0,
                     help = HelpInfo(
-                        "Charge limiter",
-                        "Stops charging at a chosen battery percentage instead of always filling to 100%. Keeping a lithium battery around 50–80% reduces wear during long plugged-in sessions, but you lose some runtime each day.",
-                        "Enable the limiter, set Stop at 80% and Resume at 75%. Charging halts at 80% and starts again after the battery falls to 75%.",
+                        "Charge limit",
+                        "Stops charging at a chosen battery percentage instead of always filling to 100%. Keeping a lithium battery around 50–80% reduces wear during long plugged-in sessions, but you lose some runtime each day.\n\nTurning it on starts with 80% / 75%. You can adjust both below.",
+                        "Stop at 80%, resume at 75%: charging halts at 80% and starts again after the battery falls to 75%.",
                     ),
                 ) {
-                    vm.set(VectorNodes.STOP, if (it) "80 75" else "0")
+                    if (it) vm.setLimit(80, 75) else vm.set(VectorNodes.STOP, 0)
                 }
                 if (stop > 0) {
                     SliderRow(
-                        "Stop at", stop, 50..100, { "$it%" },
+                        "Stop charging at", stop, 50..100, { "$it%" },
                         help = HelpInfo(
-                            "Stop at",
-                            "Battery percentage where charging stops. The kernel then holds the charge and waits for the battery to drop to the resume level. Values below 50% are rejected by the kernel.",
-                            "Stop at 80% keeps the battery near 75–80% overnight instead of sitting at 100%.",
+                            "Stop charging at",
+                            "Battery percentage where charging stops. The kernel then holds the charge and waits for the battery to drop to the resume level. The kernel only accepts 50% to 100%.",
+                            "80% keeps the battery near 75–80% overnight instead of sitting at 100%.",
                         ),
                     ) { s ->
                         val r = if (resume in 1 until s) resume else (s - 5).coerceAtLeast(1)
-                        vm.set(VectorNodes.STOP, "$s $r")
+                        vm.setLimit(s, r)
                     }
                     SliderRow(
-                        "Resume at", resume.coerceIn(1, stop - 1), 1..(stop - 1), { "$it%" },
+                        "Resume charging at", resume.coerceIn(1, stop - 1), 1..(stop - 1), { "$it%" },
                         help = HelpInfo(
-                            "Resume at",
-                            "Battery percentage where charging starts again after the limiter stopped it. Must be lower than Stop at, which creates a small working band and avoids charging on/off every few seconds.",
-                            "Stop 80% / Resume 75%: after reaching 80%, the phone waits until 75% before charging back up.",
+                            "Resume charging at",
+                            "Battery percentage where charging starts again after the limiter stopped it. It must be lower than the stop level. The gap between the two stops the phone from toggling charging on and off every few seconds.",
+                            "Stop 80% / resume 75%: after reaching 80%, the phone waits until 75% before charging again.",
                         ),
                     ) { r ->
-                        vm.set(VectorNodes.STOP, "$stop $r")
+                        vm.setLimit(stop, r)
                     }
                 }
                 if (has(VectorNodes.LIMIT_STATE)) {
                     val label = when (n[VectorNodes.LIMIT_STATE]) {
-                        0 -> "Idle"; 1 -> "Charging"; 2 -> "Holding (waiting to resume)"; else -> "Unknown"
+                        0 -> "Idle (off or unplugged)"
+                        1 -> "Charging"
+                        2 -> "Holding at limit, waiting to resume"
+                        else -> "Unknown"
                     }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Limiter state: $label", style = MaterialTheme.typography.bodySmall)
-                        Spacer(Modifier.width(6.dp))
-                        HelpButton(
-                            HelpInfo(
-                                "Limiter state",
-                                "Read-only status reported by the kernel. Idle means the limiter is off or the cable is unplugged. Charging means the battery is below the stop level. Holding means the stop level was reached and charging is paused until the battery falls to the resume level.",
-                                "Holding while plugged in at 80% is normal: the phone is running from USB power and waiting to resume at 75%.",
-                            ),
-                        )
-                    }
+                    LabelWithHelp(
+                        "Limiter status: $label",
+                        HelpInfo(
+                            "Limiter status",
+                            "Read-only status from the kernel.\n\n• Idle: the limiter is off or the cable is unplugged.\n• Charging: the battery is below the stop level.\n• Holding: the stop level was reached and charging is paused until the battery falls to the resume level.",
+                            "Holding while plugged in at 80% is normal: the phone runs from USB power and waits to resume at 75%.",
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
             }
         }
@@ -533,21 +587,23 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
             Section("Charger") {
                 if (has(VectorNodes.BYPASS)) ToggleRow(
                     "Bypass charging",
-                    "Power the phone from USB and keep the battery idle. Auto-clears on unplug or below 10%.",
+                    "Run the phone from USB power and leave the battery idle. Turns off by itself when unplugged or below 10%.",
                     on(VectorNodes.BYPASS),
                     help = HelpInfo(
                         "Bypass charging",
-                        "Runs the phone directly from the charger's USB power while the battery stays idle instead of charging. This reduces battery heat and wear during long gaming or plugged-in sessions. The kernel turns bypass off automatically when the cable is unplugged or the battery drops below 10%.",
-                        "Enable while gaming on a charger: the phone keeps running but the battery stops heating up from charge current.",
+                        "Runs the phone directly from the charger's USB power while the battery stays idle instead of charging. This reduces battery heat and wear during long gaming or plugged-in sessions. The kernel switches bypass off automatically when the cable is unplugged or the battery drops below 10%.",
+                        "Enable while gaming on a charger: the phone keeps running, but the battery stops heating up from charge current.",
                     ),
                 ) { vm.set(VectorNodes.BYPASS, it) }
                 if (has(VectorNodes.ICL)) SliderRow(
-                    "USB input current override", n[VectorNodes.ICL] ?: 0, 0..3000,
+                    "USB input current limit", n[VectorNodes.ICL] ?: 0, 0..3000,
                     { if (it == 0) "Stock" else "$it mA" },
+                    desc = "Raise this if a charger is stuck at 500 mA. Stock = no override.",
+                    step = 100,
                     help = HelpInfo(
-                        "USB input current override",
-                        "Overrides the stock input-current cap. Use this when a compliant charger or cable is wrongly detected as a low-power USB port and only draws 500 mA. 0 keeps stock behaviour. Higher values let the phone pull more current, but the charger, cable and port must actually support it.",
-                        "A 5V/2A charger stuck at 500 mA can be raised to about 1500 mA. Setting 3000 mA on a weak charger can cause overheating, voltage drops or charging instability.",
+                        "USB input current limit",
+                        "Overrides the stock input-current cap. Use this when a proper charger or cable is wrongly detected as a low-power USB port and only draws 500 mA. \"Stock\" (0) keeps the normal behavior. Higher values let the phone pull more current, but the charger, cable and port must actually support it.",
+                        "A 5V/2A charger stuck at 500 mA can be raised to about 1500 mA. 3000 mA on a weak charger can cause overheating, voltage drops or unstable charging.",
                     ),
                 ) { vm.set(VectorNodes.ICL, it) }
             }
@@ -555,60 +611,71 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
 
         // ---------- Charging thermal ----------
         if (has(VectorNodes.IGN_CHG)) item {
-            Section("Charging thermal") {
+            Section("Charging throttle") {
                 ToggleRow(
                     "Ignore vendor charging thermal",
-                    "Bypass mi_thermald current mitigation while the battery is below the trip temperature",
+                    "Don't let Xiaomi's thermal daemon slow charging because the frame feels warm",
                     on(VectorNodes.IGN_CHG),
                     help = HelpInfo(
                         "Ignore vendor charging thermal",
-                        "Stops Xiaomi's mi_thermald daemon from slowing down charging when the phone frame or skin gets warm. The kernel's JEITA temperature limits and the battery tripwire still apply, so this does not disable hardware safety. Enable it only if charging keeps dropping to a few watts while the actual battery is still comfortably cool.",
-                        "If fast charging falls to ~5W at 36 °C battery because the frame is warm, enabling this keeps full charging speed until the 45 °C trip limit.",
+                        "Stops Xiaomi's mi_thermald daemon from cutting the charging current when the phone frame (skin) gets warm. The kernel's JEITA temperature limits and the battery trip temperature still apply, so hardware safety stays active. Enable it only if charging keeps dropping to a few watts while the actual battery is still cool.",
+                        "If fast charging falls to ~5W at 36 °C battery because the frame is warm, enabling this keeps full speed until the trip temperature is reached.",
                     ),
                 ) { vm.set(VectorNodes.IGN_CHG, it) }
                 if (has(VectorNodes.VENDOR_MAX)) SliderRow(
-                    "Max mitigation level (override)", n[VectorNodes.VENDOR_MAX] ?: 18, 0..24,
-                    { if (it == 0) "0 (ignore all)" else "$it" },
+                    "Throttle ceiling", n[VectorNodes.VENDOR_MAX] ?: 18, 0..24,
+                    { if (it == 0) "0 (none)" else "$it" },
+                    desc = "Highest vendor throttle step still obeyed. Lower = faster charging. Only active when the toggle above is on.",
                     help = HelpInfo(
-                        "Max mitigation level",
-                        "When charging-thermal override is enabled, this is the highest mi_thermald mitigation step the kernel still obeys. The effective level is min(mi_thermald level, this value). 0 ignores all vendor mitigation; 18 allows up to level 18 (roughly 3.5 A). It has no effect while the ignore toggle is off.",
-                        "Set 0 for maximum charge speed, or 12 to let the vendor reduce current a little but never below step 12.",
+                        "Throttle ceiling",
+                        "Xiaomi's daemon requests throttle steps from 0 (none) to 24 (strongest). While the toggle above is on, the kernel applies min(requested step, this ceiling), so the ceiling caps how hard the vendor can throttle charging. 0 ignores vendor throttling completely; the default 18 allows up to about 3.5 A. It has no effect while the toggle is off.",
+                        "Set 0 for maximum charging speed. Set 12 to let the vendor throttle charging, but never beyond step 12.",
                     ),
                 ) { vm.set(VectorNodes.VENDOR_MAX, it) }
             }
         }
 
         // ---------- CPU / GPU / display ----------
-        item {
-            Section("CPU / GPU / Display") {
+        val perfNodes = listOf(
+            VectorNodes.IGN_CPU, VectorNodes.CPU_LITTLE, VectorNodes.CPU_BIG,
+            VectorNodes.IGN_GPU, VectorNodes.GPU_MAX, VectorNodes.IGN_BL,
+        )
+        if (perfNodes.any { has(it) }) item {
+            Section("CPU, GPU & display") {
                 if (has(VectorNodes.IGN_CPU)) ToggleRow(
-                    "Ignore vendor CPU thermal", "Stop mi_thermald from throttling CPU clocks",
+                    "Ignore vendor CPU thermal",
+                    "Don't let Xiaomi's thermal daemon lower CPU clocks because the frame feels warm",
                     on(VectorNodes.IGN_CPU),
                     help = HelpInfo(
                         "Ignore vendor CPU thermal",
-                        "Prevents mi_thermald from capping CPU clock speeds just because the phone's exterior is warm. This does not remove the kernel's own thermal protection: all overrides are revoked when the battery reaches the trip temperature.",
+                        "Prevents mi_thermald from capping CPU clock speeds just because the phone's exterior is warm. The kernel's own protection stays active: all overrides are revoked when the battery reaches the trip temperature.",
                         "Enable for sustained gaming or heavy apps when the phone feels warm but the battery is still below about 40 °C.",
                     ),
                 ) { vm.set(VectorNodes.IGN_CPU, it) }
                 if (has(VectorNodes.CPU_LITTLE)) IntFieldRow(
-                    "Little cluster max cooling state", "0 = no cap", n[VectorNodes.CPU_LITTLE] ?: 0,
+                    "Little cores: throttle limit",
+                    "0 = no throttling (full speed). Applies while the CPU override is on.",
+                    n[VectorNodes.CPU_LITTLE] ?: 0,
                     help = HelpInfo(
-                        "Little cluster max cooling state",
-                        "Sets the highest kernel cooling state allowed for the Cortex-A55 little cores while the CPU override is active. 0 means no cap and the full 1.80 GHz is available. Larger numbers allow stronger throttling.",
-                        "0 = full speed; 5 = let the kernel throttle up to cooling state 5 for the little cluster.",
+                        "Little cores: throttle limit",
+                        "The highest kernel cooling state allowed for the Cortex-A55 little cores while the CPU override is on. 0 means no cap and the full 1.80 GHz stays available. Larger numbers allow stronger throttling.",
+                        "0 = full speed. 5 = the kernel may throttle the little cluster up to cooling state 5.",
                     ),
                 ) { vm.set(VectorNodes.CPU_LITTLE, it) }
                 if (has(VectorNodes.CPU_BIG)) IntFieldRow(
-                    "Big cluster max cooling state", "0 = no cap", n[VectorNodes.CPU_BIG] ?: 0,
+                    "Big cores: throttle limit",
+                    "0 = no throttling (full speed). Applies while the CPU override is on.",
+                    n[VectorNodes.CPU_BIG] ?: 0,
                     help = HelpInfo(
-                        "Big cluster max cooling state",
-                        "Sets the highest kernel cooling state allowed for the Cortex-A76 big cores while the CPU override is active. 0 means no cap and the full 2.21 GHz is available. Larger numbers allow stronger throttling.",
-                        "0 = full speed; 5 = let the kernel throttle up to cooling state 5 for the big cluster.",
+                        "Big cores: throttle limit",
+                        "The highest kernel cooling state allowed for the Cortex-A76 big cores while the CPU override is on. 0 means no cap and the full 2.21 GHz stays available. Larger numbers allow stronger throttling.",
+                        "0 = full speed. 5 = the kernel may throttle the big cluster up to cooling state 5.",
                     ),
                 ) { vm.set(VectorNodes.CPU_BIG, it) }
 
                 if (has(VectorNodes.IGN_GPU)) ToggleRow(
-                    "Ignore vendor GPU thermal", "Stop mi_thermald from downclocking the GPU",
+                    "Ignore vendor GPU thermal",
+                    "Don't let Xiaomi's thermal daemon lower GPU clocks because the frame feels warm",
                     on(VectorNodes.IGN_GPU),
                     help = HelpInfo(
                         "Ignore vendor GPU thermal",
@@ -617,21 +684,24 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
                     ),
                 ) { vm.set(VectorNodes.IGN_GPU, it) }
                 if (has(VectorNodes.GPU_MAX)) IntFieldRow(
-                    "GPU max cooling state", "0 = no cap", n[VectorNodes.GPU_MAX] ?: 0,
+                    "GPU: throttle limit",
+                    "0 = no throttling (full speed). Applies while the GPU override is on.",
+                    n[VectorNodes.GPU_MAX] ?: 0,
                     help = HelpInfo(
-                        "GPU max cooling state",
-                        "Maximum GPU cooling state allowed while the GPU override is active. 0 means no cap and unthrottled GPU frequencies. Larger numbers permit more aggressive GPU throttling.",
-                        "0 = no GPU cap; 4 = allow the kernel to throttle the GPU up to state 4.",
+                        "GPU: throttle limit",
+                        "The highest GPU cooling state allowed while the GPU override is on. 0 means no cap and unthrottled GPU frequencies. Larger numbers allow more aggressive GPU throttling.",
+                        "0 = no GPU cap. 4 = the kernel may throttle the GPU up to state 4.",
                     ),
                 ) { vm.set(VectorNodes.GPU_MAX, it) }
 
                 if (has(VectorNodes.IGN_BL)) ToggleRow(
-                    "Ignore vendor backlight thermal", "Stop mi_thermald from dimming the display",
+                    "Ignore vendor backlight thermal",
+                    "Don't let Xiaomi's thermal daemon dim the screen because the frame feels warm",
                     on(VectorNodes.IGN_BL),
                     help = HelpInfo(
                         "Ignore vendor backlight thermal",
-                        "Stops mi_thermald from dimming the screen when the chassis gets warm. Brightness remains under your control, but the display will add heat at high levels.",
-                        "Enable if the screen suddenly dims during navigation or gaming despite auto-brightness being off.",
+                        "Stops mi_thermald from dimming the screen when the chassis gets warm. The display adds heat at high brightness, so expect the phone to run a bit warmer.",
+                        "Enable if the screen suddenly dims during navigation or gaming even with auto-brightness off.",
                     ),
                 ) { vm.set(VectorNodes.IGN_BL, it) }
             }
@@ -639,73 +709,101 @@ fun Dashboard(snap: Snapshot, error: String?, vm: VectorViewModel) {
 
         // ---------- Guardrails ----------
         if (has(VectorNodes.TRIP) || has(VectorNodes.SKIN)) item {
-            Section("Safety guardrails") {
+            Section(
+                "Safety guardrails",
+                subtitle = "When a limit is reached, every override above switches off automatically.",
+            ) {
                 val trip = n[VectorNodes.TRIP] ?: 450
                 if (has(VectorNodes.TRIP)) SliderRow(
                     "Battery trip temperature", trip, 400..470, { "%.1f °C".format(it / 10f) },
+                    desc = "Overrides switch off at this battery temperature. Default 45.0 °C.",
+                    step = 5,
                     help = HelpInfo(
                         "Battery trip temperature",
-                        "Hard safety tripwire based on the real battery cell temperature from the fuel gauge. When this temperature is reached, every thermal override is cancelled immediately and stock throttling is restored. Default is 45.0 °C; the allowed range is 40.0–47.0 °C. Lower is safer.",
-                        "43.0 °C gives an extra safety margin while gaming; 45.0 °C is the stock default.",
+                        "Hard safety tripwire based on the real battery cell temperature from the fuel gauge. When it's reached, every thermal override is cancelled immediately and stock throttling is restored. Default is 45.0 °C; allowed range is 40.0–47.0 °C. Lower is safer.",
+                        "43.0 °C gives an extra safety margin while gaming; 45.0 °C is the default.",
                     ),
                 ) { vm.set(VectorNodes.TRIP, it) }
                 if (has(VectorNodes.CLEAR)) {
                     val max = trip - 20
                     SliderRow(
-                        "Battery clear temperature", (n[VectorNodes.CLEAR] ?: 420).coerceAtMost(max),
+                        "Battery re-enable temperature",
+                        (n[VectorNodes.CLEAR] ?: 420).coerceAtMost(max),
                         300..max, { "%.1f °C".format(it / 10f) },
+                        desc = "After a trip, overrides come back once the battery cools below this. Must be at least 2.0 °C under the trip temperature.",
+                        step = 5,
                         help = HelpInfo(
-                            "Battery clear temperature",
-                            "After a trip, overrides stay off until the battery cools below this temperature. It must be at least 2.0 °C below the trip temperature, which prevents the phone from rapidly switching between overridden and stock thermal states. Default is 42.0 °C.",
-                            "Trip 45.0 °C / Clear 42.0 °C: overrides come back only after a 3 °C cool-down.",
+                            "Battery re-enable temperature",
+                            "After a trip, overrides stay off until the battery cools below this temperature. It must be at least 2.0 °C below the trip temperature, which stops the phone from rapidly switching between overridden and stock thermal states. Default is 42.0 °C.",
+                            "Trip 45.0 °C / re-enable 42.0 °C: overrides return only after a 3 °C cool-down.",
                         ),
                     ) { vm.set(VectorNodes.CLEAR, it) }
                 }
                 if (has(VectorNodes.SKIN)) {
                     val skin = n[VectorNodes.SKIN] ?: 0
                     ToggleRow(
-                        "Skin temperature guardrail",
-                        "Revoke overrides when chassis gets too hot",
+                        "Frame temperature limit",
+                        "Also switch overrides off when the phone's frame gets too hot",
                         skin > 0,
                         help = HelpInfo(
-                            "Skin temperature guardrail",
-                            "Optional extra guardrail that watches the chassis skin thermistor. If the phone frame reaches the chosen temperature, all thermal overrides are revoked with a 2 °C release hysteresis. 0 disables it. This protects your hands and the exterior, not the battery chemistry.",
+                            "Frame temperature limit",
+                            "Optional extra guardrail that watches the chassis (skin) thermistor. If the frame reaches the chosen temperature, all thermal overrides are revoked, and they return after it cools by 2 °C. Off by default. This protects your hands and the exterior, not the battery chemistry.",
                             "Set 50 °C so overrides switch off if the frame becomes uncomfortably hot to hold.",
                         ),
                     ) {
                         vm.set(VectorNodes.SKIN, if (it) 50000 else 0)
                     }
                     if (skin > 0) SliderRow(
-                        "Skin limit", skin.coerceIn(45000, 60000), 45000..60000,
+                        "Frame limit", skin.coerceIn(45000, 60000), 45000..60000,
                         { "%.1f °C".format(it / 1000f) },
+                        step = 500,
                         help = HelpInfo(
-                            "Skin limit",
-                            "Chassis temperature where the skin guardrail revokes overrides. Range 45.0–60.0 °C. The value is stored in millidegrees; the app rounds it to the nearest 0.5 °C.",
+                            "Frame limit",
+                            "Chassis temperature where the guardrail revokes overrides. Range 45.0–60.0 °C, in 0.5 °C steps.",
                             "50.0 °C is a reasonable starting point; 45.0 °C is very conservative.",
                         ),
-                    ) { vm.set(VectorNodes.SKIN, (it / 500) * 500) }
+                    ) { vm.set(VectorNodes.SKIN, it) }
                 }
             }
+        }
+
+        item {
+            Text(
+                "Changes apply immediately and reset to kernel defaults after a reboot.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                textAlign = TextAlign.Center,
+            )
         }
     }
 }
 
 @Composable
 fun Header(snap: Snapshot) {
-    val charging = snap.status.equals("Charging", ignoreCase = true)
+    val label = when {
+        snap.status.equals("Charging", ignoreCase = true) -> "Charging current"
+        snap.status.equals("Discharging", ignoreCase = true) -> "Discharge current"
+        else -> "Battery current"
+    }
     val mA = abs(snap.currentUa) / 1000
     val watts = abs(snap.currentUa) / 1e6 * (snap.voltageUv / 1e6)
 
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         BatteryGauge(snap.capacity, Modifier.width(110.dp).height(200.dp))
-        Spacer(Modifier.width(24.dp))
-        Column {
+        Spacer(Modifier.width(20.dp))
+        Column(Modifier.weight(1f)) {
+            Text(label, style = MaterialTheme.typography.labelLarge)
             Text(
-                if (charging) "Charging speed" else "Current draw",
-                style = MaterialTheme.typography.labelLarge,
+                "$mA mA",
+                fontSize = 34.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
             )
-            Text("$mA mA", fontSize = 40.sp, fontWeight = FontWeight.Bold)
-            Text("%.1f W".format(watts), style = MaterialTheme.typography.titleMedium)
+            Text(
+                "≈ %.1f W at the battery".format(watts),
+                style = MaterialTheme.typography.titleSmall,
+            )
             Spacer(Modifier.height(8.dp))
             Text(snap.status.ifEmpty { "Unknown" }, style = MaterialTheme.typography.bodyMedium)
             Text(
@@ -725,10 +823,23 @@ fun Header(snap: Snapshot) {
 // ============================================================
 
 @Composable
-fun Section(title: String, content: @Composable ColumnScope.() -> Unit) {
+fun Section(
+    title: String,
+    subtitle: String? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text(title, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+            Column {
+                Text(title, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+                if (subtitle != null) {
+                    Text(
+                        subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
             content()
         }
     }
@@ -744,13 +855,7 @@ fun ToggleRow(
 ) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(title, style = MaterialTheme.typography.bodyLarge)
-                if (help != null) {
-                    Spacer(Modifier.width(6.dp))
-                    HelpButton(help)
-                }
-            }
+            LabelWithHelp(title, help)
             Text(desc, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Spacer(Modifier.width(12.dp))
@@ -764,6 +869,8 @@ fun SliderRow(
     value: Int,
     range: IntRange,
     format: (Int) -> String,
+    desc: String? = null,
+    step: Int = 1,
     help: HelpInfo? = null,
     onCommit: (Int) -> Unit,
 ) {
@@ -773,19 +880,31 @@ fun SliderRow(
     // Follow the kernel only while the user isn't dragging.
     LaunchedEffect(value) { if (!dragging) local = value.toFloat() }
 
+    // Snap to the step grid (only when the range divides evenly).
+    fun snap(v: Float): Int {
+        val r = v.roundToInt().coerceIn(range.first, range.last)
+        if (step <= 1 || (range.last - range.first) % step != 0) return r
+        val k = ((r - range.first).toFloat() / step).roundToInt()
+        return (range.first + k * step).coerceIn(range.first, range.last)
+    }
+
     Column {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(title, style = MaterialTheme.typography.bodyLarge)
-            if (help != null) {
-                Spacer(Modifier.width(6.dp))
-                HelpButton(help)
-            }
-            Spacer(Modifier.weight(1f))
-            Text(format(local.roundToInt()), style = MaterialTheme.typography.bodyMedium)
+            LabelWithHelp(title, help, Modifier.weight(1f))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                format(local.roundToInt()),
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                softWrap = false,
+            )
+        }
+        if (desc != null) {
+            Text(desc, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Slider(
             value = local.coerceIn(range.first.toFloat(), range.last.toFloat()),
-            onValueChange = { dragging = true; local = it },
+            onValueChange = { dragging = true; local = snap(it).toFloat() },
             onValueChangeFinished = {
                 dragging = false
                 onCommit(local.roundToInt())
@@ -810,13 +929,7 @@ fun IntFieldRow(
     LaunchedEffect(value) { if (!focused) text = value.toString() }
 
     Column {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(title, style = MaterialTheme.typography.bodyLarge)
-            if (help != null) {
-                Spacer(Modifier.width(6.dp))
-                HelpButton(help)
-            }
-        }
+        LabelWithHelp(title, help)
         Text(desc, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
